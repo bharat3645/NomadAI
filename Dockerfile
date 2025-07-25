@@ -21,11 +21,14 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Copy project files
 COPY . .
 
+# Make entrypoint.sh executable
+RUN chmod +x /app/entrypoint.sh
+
 # The EXPOSE instruction is not used by Cloud Run but is good practice.
 # It's better to remove it or have it reflect the variable.
 # We will remove it to avoid confusion.
 
 # Command to run the FastAPI app.
 # This now correctly uses the PORT environment variable provided by Cloud Run.
-CMD uvicorn main:app --host 0.0.0.0 --port $PORT
+ENTRYPOINT ["/app/entrypoint.sh"]
 
