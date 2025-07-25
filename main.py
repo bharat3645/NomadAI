@@ -1,266 +1,323 @@
 import os
 import json
 import logging
-import requests
-from fastapi import FastAPI, Request
+import secrets
+import asyncio
+from datetime import datetime
+import pytz
+from collections import defaultdict, deque
+
+from fastapi import FastAPI, Request, Response, HTTPException
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.constants import ChatAction
 from dotenv import load_dotenv
 from groq import Groq
 import whisper
 from gtts import gTTS
+import requests
 
-# Load environment variables from .env file for local development
+# --- Initial Setup & Configuration ---
+
+# Load environment variables from a .env file for local development
 load_dotenv()
 
-# --- API Keys and Tokens ---
-# Securely fetch secrets from environment variables
+# Securely fetch secrets from environment variables.
+# The application will fail to start if any of these are missing.
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
+# A secret token to secure the webhook, preventing unauthorized requests.
+WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", secrets.token_hex(16))
 
-# --- Initialize Clients ---
-# Initialize the Telegram Bot client
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
-# Initialize the Groq client for LLM access
-groq_client = Groq(api_key=GROQ_API_KEY)
-# Load the Whisper model. "base" is a good balance of speed and accuracy for a hackathon.
-# Use "tiny" if the "base" model is too slow or memory-intensive on the free hosting tier.
-whisper_model = whisper.load_model("base")
+# Validate that all necessary API keys are present.
+if not all([TELEGRAM_BOT_TOKEN, GROQ_API_KEY, GOOGLE_MAPS_API_KEY]):
+    raise ValueError("Missing one or more critical API keys in environment variables.")
 
 # --- Logging Configuration ---
-# Set up basic logging to see bot activity and errors in the console or server logs.
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# --- Load Secret Data ---
-# Load our curated insider tips from the JSON file into memory.
-with open('delhi_secrets.json', 'r') as f:
-    delhi_secrets = json.load(f)
+# --- In-Memory Cache for Conversation History ---
+# For a production system, this would be replaced with Redis or a similar cache.
+# Stores the last 2 interactions for each user.
+conversation_history = defaultdict(lambda: deque(maxlen=4)) # Stores (user_msg, bot_msg) pairs
+
+# --- Initialize Clients & Load Data ---
+try:
+    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+    groq_client = Groq(api_key=GROQ_API_KEY)
+    whisper_model = whisper.load_model("base")
+
+    with open('delhi_secrets.json', 'r', encoding='utf-8') as f:
+        delhi_secrets = json.load(f)
+
+except FileNotFoundError:
+    logger.error("delhi_secrets.json not found! The bot will run without insider tips.")
+    delhi_secrets = {}
+except Exception as e:
+    logger.critical(f"Failed to initialize a critical service: {e}")
+    raise
 
 # --- FastAPI App Initialization ---
-# This creates the main web application instance.
 app = FastAPI()
+telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-def detect_language(text: str) -> str:
-    """Detects the language of the text using a fast LLM."""
+
+# --- Core AI and Data Functions ---
+
+async def get_current_time_in_delhi() -> str:
+    """Returns a formatted string of the current time and day in Delhi."""
+    delhi_tz = pytz.timezone("Asia/Kolkata")
+    now = datetime.now(delhi_tz)
+    return now.strftime("%A, %I:%M %p")
+
+async def detect_language_and_vibe(text: str) -> (str, str):
+    """Detects language and infers user vibe in a single, efficient LLM call."""
+    if not text.strip():
+        return "english", "neutral"
     try:
-        # This is a specialized, low-cost API call just for language detection.
-        chat_completion = groq_client.chat.completions.create(
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a language detection expert. Analyze the following text and respond with only the name of the language in lowercase. For example: 'english', 'hindi', 'french'."
-                },
-                {
-                    "role": "user",
-                    "content": text,
-                }
-            ],
-            model="llama3-8b-8192", # Use the smaller, faster model for this simple task.
+        prompt = f"""
+        Analyze the following user query. Respond with a JSON object containing two keys:
+        1. "language": The detected language of the text in lowercase (e.g., "english", "hindi").
+        2. "vibe": Your best guess for the user's mood or intent. Choose one from: ["adventurous", "relaxed", "hungry", "curious", "in_a_hurry", "social", "neutral"].
+
+        User Query: "{text}"
+        """
+        chat_completion = await asyncio.to_thread(
+            groq_client.chat.completions.create,
+            messages=[{"role": "system", "content": prompt}],
+            model="llama3-8b-8192",
             temperature=0.1,
+            response_format={"type": "json_object"},
         )
-        return chat_completion.choices[0].message.content.strip().lower()
+        result = json.loads(chat_completion.choices[0].message.content)
+        language = result.get("language", "english")
+        vibe = result.get("vibe", "neutral")
+        return language, vibe
     except Exception as e:
-        logger.error(f"Error in language detection: {e}")
-        return "english" # Default to English on error to ensure the bot can always respond.
+        logger.error(f"Error in language/vibe detection: {e}")
+        return "english", "neutral"
 
-def get_places_data(query: str) -> str:
-    """Fetches real-time data from Google Maps Places API."""
-    # The URL is constructed to search for the user's query specifically within Delhi.
-    url = f"https://maps.googleapis.com/maps/api/place/textsearch/json?query={query} in Delhi&key={GOOGLE_MAPS_API_KEY}"
+async def get_places_data(query: str) -> str:
+    """Fetches real-time data from Google Maps Places API asynchronously."""
+    url = f"https://maps.googleapis.com/maps/api/place/textsearch/json?query={requests.utils.quote(query)} in Delhi&key={GOOGLE_MAPS_API_KEY}"
     try:
-        response = requests.get(url)
-        response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
+        # Using asyncio-compatible HTTP library would be ideal, but for this scope,
+        # running requests in a thread pool is a good compromise.
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(None, lambda: requests.get(url, timeout=5))
+        response.raise_for_status()
         data = response.json().get('results', [])
         if not data:
             return "No relevant places found."
-
-        # Format the data cleanly for the LLM to easily parse.
-        # Providing a few key details for the top 3 results is enough for a conversational response.
-        formatted_data = "\n".join([
-            f"- Name: {place.get('name')}, Rating: {place.get('rating', 'N/A')}, Address: {place.get('formatted_address', 'N/A')}"
-            for place in data[:3] # Get top 3 results
+        return "\n".join([
+            f"- Name: {place.get('name')}, Rating: {place.get('rating', 'N/A')}"
+            for place in data[:3]
         ])
-        return formatted_data
-    except Exception as e:
+    except requests.exceptions.RequestException as e:
         logger.error(f"Error fetching Google Places data: {e}")
         return "Sorry, I couldn't fetch live location data right now."
 
-def generate_master_prompt(language: str, user_query: str, places_data: str) -> str:
-    """Generates the dynamic, persona-driven prompt for the main LLM call."""
-
-    # Find relevant secret tips by checking if any landmark name is in the user's query.
+def generate_master_prompt(language: str, user_query: str, places_data: str, history: list, time_info: str, vibe: str) -> str:
+    """Generates the advanced, context-aware prompt for the main LLM call."""
     secret_tip = "No specific insider tip found for this query."
     for place, data in delhi_secrets.items():
         if place.lower() in user_query.lower():
-            secret_tip = f"Insider Tip for {place}: {data['universal_tip']}"
+            secret_tip = f"Insider Tip for {place}: {data.get('universal_tip', '')}"
             if 'warning' in data:
                 secret_tip += f" (Warning: {data['warning']})"
             break
+    
+    formatted_history = "\n".join([f"User: {h[0]}\nBot: {h[1]}" for h in history])
+    persona_instruction = persona_instruction_map.get(language, persona_instruction_map["default"])
 
-    # This is the core of the "Persona Chameleon". We dynamically generate the persona instructions.
-    persona_instruction = ""
-    if "hindi" in language or "hinglish" in language:
-        persona_instruction = "Your persona is 'Dilli Dost'. You are a witty, friendly best friend. You MUST speak in Hinglish (a mix of Hindi and English). Use slang like 'yaar', 'bhai', 'scene', 'chill', 'mast'. Be enthusiastic and informal."
-    elif "french" in language:
-        persona_instruction = "Your persona is 'Votre ami à Delhi'. Be warm, encouraging, and polite. Use phrases like 'Bienvenue' and 'Profitez bien'. Respond in fluent, natural-sounding French."
-    elif "spanish" in language:
-        persona_instruction = "Your persona is 'Tu amigo en Delhi'. Be friendly, enthusiastic, and helpful. Use phrases like '¡Hola!' and '¡Qué disfrutes!'. Respond in fluent, natural-sounding Spanish."
-    else: # Default persona for any other language
-        persona_instruction = "Your persona is a friendly and knowledgeable local guide. Be clear, helpful, and welcoming. Respond in fluent, natural-sounding English."
+    return f"""
+    You are NomadAI, an expert, friendly local guide for Delhi. Your personality MUST adapt based on the user's language.
+    Your knowledge is your own; do not mention that you are using Google Maps or a database.
 
-    # The master prompt is a detailed instruction manual for the LLM.
-    prompt = f"""
-    You are NomadAI, a helpful and friendly local guide in Delhi. Your personality MUST adapt based on the user's language.
+    **Current Context:**
+    - Time in Delhi: {time_info}
+    - User's Detected Vibe: {vibe}
+    - Detected Language: {language}
+    - Your Persona: {persona_instruction}
 
-    **Detected Language:** {language}
-    **Your Persona Instruction:** {persona_instruction}
+    **Conversation History (for context):**
+    {formatted_history if formatted_history else "This is the beginning of the conversation."}
 
     **Your Task:**
-    1. Respond ONLY in fluent and natural-sounding `{language}`. Do not mix languages unless the persona is Hinglish.
-    2. Weave the [Live Data] and [Secret Tip] together into a single, conversational, and helpful response. Do not just list the data like a robot. Synthesize it into a real recommendation.
-    3. If the user query is a simple greeting (like 'hello' or 'how are you'), respond with a warm greeting in the detected language and persona. Do not perform a location search for a simple greeting.
-    4. Translate the meaning and vibe of the [Secret Tip], not just a literal word-for-word translation. Capture the *feeling* of the tip.
+    1. Based on the **Current User Query** below, and all the context provided, generate a helpful, conversational response.
+    2. Respond ONLY in fluent, natural-sounding `{language}`.
+    3. Synthesize [Live Data] and [Secret Tip] into your response. Don't just list them.
+    4. Your recommendation should be appropriate for the current time and the user's vibe.
+    5. If the query is a follow-up, use the conversation history to understand it (e.g., "how do I get there?").
 
     ---
-    **User's Query (in their language):** "{user_query}"
+    **[Live Data]:** {places_data}
+    **[Secret Tip]:** {secret_tip}
     ---
-    **[Live Data from Google Maps]:**
-    {places_data}
-    ---
-    **[Secret Tip from Local Database]:**
-    {secret_tip}
+    **Current User Query:** "{user_query}"
     ---
 
     Now, act as their friend and respond.
     """
-    return prompt
 
 def get_ai_response(prompt: str) -> str:
     """Gets the final, synthesized response from the powerful LLM."""
     try:
         chat_completion = groq_client.chat.completions.create(
-            messages=[
-                {
-                    "role": "system",
-                    "content": prompt,
-                }
-            ],
-            model="llama3-70b-8192", # Use the more powerful model for the final creative response.
+            messages=[{"role": "system", "content": prompt}],
+            model="llama3-70b-8192",
         )
         return chat_completion.choices[0].message.content
     except Exception as e:
         logger.error(f"Error getting AI response: {e}")
         return "I'm sorry, I'm having a little trouble thinking right now. Please try again in a moment."
 
+# --- Audio Processing Functions ---
 
-def transcribe_voice(audio_file_path: str) -> str:
-    """Transcribes audio file to text using Whisper."""
-    try:
-        # The core transcription call.
-        result = whisper_model.transcribe(audio_file_path)
-        return result["text"]
-    except Exception as e:
-        logger.error(f"Error in transcription: {e}")
-        return ""
+async def transcribe_voice(audio_file_path: str) -> str:
+    """Transcribes audio file to text using Whisper in a separate thread."""
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(
+        None, lambda: whisper_model.transcribe(audio_file_path, fp16=False)
+    )
+    return result["text"]
 
-def text_to_speech(text: str, lang: str) -> str:
-    """Converts text to speech and saves it as an OGG file for Telegram."""
-    # gTTS requires specific language codes. This map handles our primary languages.
-    # It's easily extensible with more languages supported by gTTS.
-    lang_code_map = {"hindi": "hi", "hinglish": "hi", "french": "fr", "spanish": "es"}
-    # Default to English ('en') if the detected language isn't in our map.
+async def text_to_speech(text: str, lang: str) -> str | None:
+    """Converts text to speech and saves it as an OGG file asynchronously."""
     lang_code = lang_code_map.get(lang.split()[0], 'en')
-
+    output_path = f"response_{secrets.token_hex(4)}.ogg"
     try:
         tts = gTTS(text=text, lang=lang_code, slow=False)
-        # Telegram prefers .ogg, but we save as .mp3 and let Telegram handle it.
-        # Using a consistent filename is fine for this single-threaded hackathon app.
-        audio_file_path = "response.ogg"
-        tts.save(audio_file_path)
-        return audio_file_path
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, tts.save, output_path)
+        return output_path
     except Exception as e:
         logger.error(f"Error in text-to-speech conversion: {e}")
         return None
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sends a welcome message when the /start command is issued."""
+# --- Telegram Handlers ---
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Sends a welcome message for the /start command."""
+    conversation_history[update.effective_chat.id].clear()
     await update.message.reply_text(
         "Hey! I'm NomadAI. Send me a voice message in any language about what you want to do or see in Delhi!"
     )
 
+async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles user feedback."""
+    feedback_text = " ".join(context.args)
+    if not feedback_text:
+        await update.message.reply_text("Thanks! Please provide your feedback after the command, like: /feedback The bot was very helpful!")
+        return
+    logger.info(f"FEEDBACK from {update.effective_chat.id}: {feedback_text}")
+    await update.message.reply_text("Thank you for your feedback! It helps me get better.")
+
 async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles voice messages, processes them, and sends a voice response."""
-    # Let the user know the message was received and is being processed.
-    await update.message.reply_text("Got it! Let me think for a moment...")
+    """Main handler for processing voice messages with advanced logic."""
+    chat_id = update.effective_chat.id
+    audio_file_path = None
+    response_audio_path = None
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.RECORD_VOICE)
+        
+        voice = update.message.voice
+        file = await context.bot.get_file(voice.file_id)
+        audio_file_path = f"{voice.file_id}.ogg"
+        await file.download_to_drive(audio_file_path)
 
-    voice = update.message.voice
-    file = await context.bot.get_file(voice.file_id)
+        user_query_text = await transcribe_voice(audio_file_path)
+        if not user_query_text:
+            await update.message.reply_text("Sorry, I couldn't understand that. Could you please speak a bit more clearly?")
+            return
 
-    # Download the voice note to a temporary file.
-    audio_file_path = f"{voice.file_id}.ogg"
-    await file.download_to_drive(audio_file_path)
+        logger.info(f"User ({chat_id}): {user_query_text}")
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
-    # --- Main Processing Pipeline ---
-    # 1. Transcribe (Ears)
-    user_query_text = transcribe_voice(audio_file_path)
-    if not user_query_text:
-        await update.message.reply_text("Sorry, I couldn't understand that. Could you please speak a bit more clearly?")
-        os.remove(audio_file_path) # Cleanup
-        return
+        # --- Asynchronous Data Gathering ---
+        time_task = get_current_time_in_delhi()
+        lang_vibe_task = detect_language_and_vibe(user_query_text)
+        places_task = get_places_data(user_query_text)
+        
+        time_info, (language, vibe), places_data = await asyncio.gather(
+            time_task, lang_vibe_task, places_task
+        )
+        logger.info(f"Context for {chat_id}: Lang={language}, Vibe={vibe}, Time={time_info}")
+        
+        # --- AI Response Generation ---
+        history = list(conversation_history[chat_id])
+        master_prompt = generate_master_prompt(language, user_query_text, places_data, history, time_info, vibe)
+        ai_response_text = await asyncio.to_thread(get_ai_response, master_prompt)
+        logger.info(f"Bot ({chat_id}): {ai_response_text}")
 
-    logger.info(f"Transcribed Text: {user_query_text}")
+        # Update conversation history
+        conversation_history[chat_id].append((user_query_text, ai_response_text))
 
-    # 2. Understand (Brain - Part 1: Language Detection)
-    language = detect_language(user_query_text)
-    logger.info(f"Detected Language: {language}")
+        # --- Send Response ---
+        response_audio_path = await text_to_speech(ai_response_text, language)
+        if response_audio_path:
+            await context.bot.send_voice(chat_id=chat_id, voice=open(response_audio_path, 'rb'))
+        else:
+            await update.message.reply_text("Sorry, I'm feeling a bit speechless right now. Please try again.")
 
-    # 3. Gather Data (Knowledge)
-    places_data = get_places_data(user_query_text)
+    except Exception as e:
+        logger.error(f"An unexpected error occurred in handle_voice_message: {e}", exc_info=True)
+        await update.message.reply_text("Oops! Something went wrong on my end. Please try again in a moment.")
+    finally:
+        # Robust cleanup of temporary audio files
+        if audio_file_path and os.path.exists(audio_file_path):
+            os.remove(audio_file_path)
+        if response_audio_path and os.path.exists(response_audio_path):
+            os.remove(response_audio_path)
 
-    # 4. Generate Final Prompt (Brain - Part 2: Persona Infusion)
-    master_prompt = generate_master_prompt(language, user_query_text, places_data)
+# --- FastAPI Webhook Endpoint ---
 
-    # 5. Get AI Response (Brain - Part 3: Creative Synthesis)
-    ai_response_text = get_ai_response(master_prompt)
-    logger.info(f"AI Response Text: {ai_response_text}")
-
-    # 6. Convert to Speech (Voice)
-    response_audio_path = text_to_speech(ai_response_text, language)
-    if not response_audio_path:
-        await update.message.reply_text("Sorry, I'm feeling a bit speechless right now. Please try again.")
-        os.remove(audio_file_path) # Cleanup
-        return
-
-    # 7. Send Response
-    await context.bot.send_voice(chat_id=update.effective_chat.id, voice=open(response_audio_path, 'rb'))
-
-    # 8. Cleanup temporary files
-    os.remove(audio_file_path)
-    os.remove(response_audio_path)
-
-# This part is for setting up the webhook with FastAPI for deployment.
-# It allows Telegram to send updates to our web server.
 @app.post("/")
-async def process_update(request: Request):
-    """Processes update from Telegram via webhook."""
-    data = await request.json()
-    update = Update.de_json(data, bot)
+async def process_telegram_update(request: Request):
+    """Handles all incoming updates from the Telegram webhook with security."""
+    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET_TOKEN:
+        logger.warning("Received a request with an invalid secret token.")
+        raise HTTPException(status_code=403, detail="Invalid secret token")
+    try:
+        data = await request.json()
+        update = Update.de_json(data, bot)
+        await telegram_app.process_update(update)
+        return Response(status_code=200)
+    except Exception as e:
+        logger.error(f"Error processing update: {e}", exc_info=True)
+        return Response(status_code=500)
 
-    # Manually dispatching the update to the correct handler.
-    # This is a simplified approach for our specific use case.
-    if update.message:
-        if update.message.text and update.message.text.startswith('/start'):
-            await start(update, None) # Context is not needed for this simple handler
-        elif update.message.voice:
-            # We create a dummy context for the handler to work within the FastAPI environment.
-            application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-            dummy_context = ContextTypes.DEFAULT_TYPE(application=application, chat_id=update.effective_chat.id)
-            await handle_voice_message(update, dummy_context)
+@app.on_event("startup")
+async def startup_event():
+    """Actions to take on application startup."""
+    global persona_instruction_map, lang_code_map
+    persona_instruction_map = {
+        "hindi": "Your persona is 'Dilli Dost'. You are a witty, friendly best friend. You MUST speak in Hinglish... Be enthusiastic and informal.",
+        "hinglish": "Your persona is 'Dilli Dost'. You are a witty, friendly best friend. You MUST speak in Hinglish... Be enthusiastic and informal.",
+        "french": "Your persona is 'Votre ami à Delhi'. Be warm, encouraging, and polite...",
+        "spanish": "Your persona is 'Tu amigo en Delhi'. Be friendly, enthusiastic, and helpful...",
+        "default": "Your persona is a friendly and knowledgeable local guide. Be clear, helpful, and welcoming..."
+    }
+    lang_code_map = {"hindi": "hi", "hinglish": "hi", "french": "fr", "spanish": "es"}
 
+    logger.info("Application startup...")
+    telegram_app.add_handler(CommandHandler("start", start_command))
+    telegram_app.add_handler(CommandHandler("feedback", feedback_command))
+    telegram_app.add_handler(MessageHandler(filters.VOICE & ~filters.COMMAND, handle_voice_message))
+
+    webhook_url = os.getenv("WEBHOOK_URL")
+    if webhook_url:
+        await telegram_app.bot.set_webhook(url=f"{webhook_url}/", secret_token=WEBHOOK_SECRET_TOKEN)
+        logger.info(f"Webhook set successfully to {webhook_url}")
+    else:
+        logger.warning("WEBHOOK_URL environment variable not set. Webhook not configured.")
+
+@app.get("/health")
+async def health_check():
+    """A simple health check endpoint to verify the service is running."""
     return {"status": "ok"}
-
