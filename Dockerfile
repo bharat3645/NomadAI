@@ -21,8 +21,11 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Copy project files
 COPY . .
 
-# Expose port for FastAPI
-EXPOSE 8000
+# The EXPOSE instruction is not used by Cloud Run but is good practice.
+# It's better to remove it or have it reflect the variable.
+# We will remove it to avoid confusion.
 
-# Command to run the FastAPI app
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"] 
+# Command to run the FastAPI app.
+# This now correctly uses the PORT environment variable provided by Cloud Run.
+CMD uvicorn main:app --host 0.0.0.0 --port $PORT
+
