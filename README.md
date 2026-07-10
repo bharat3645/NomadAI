@@ -130,7 +130,7 @@ Point your bot's webhook to your FastAPI server's public URL.
 ---
 
 ## 🛡️ License
-MIT License (or specify your own)
+This project is licensed under the MIT License — see [LICENSE](./LICENSE) for the full text.
 
 ---
 
@@ -141,4 +141,4 @@ MIT License (or specify your own)
 ---
 
 ## 🙌 Contributing
-Pull requests and ideas welcome! Let’s make travel smarter, together. 
+Pull requests and ideas welcome! Let's make travel smarter, together.
