@@ -1,7 +1,5 @@
 # 🕌 NomadAI: The Ultimate AI Travel Companion for Delhi
 
-![NomadAI Banner](https://imgur.com/4M7Qw2B.png)
-
 > **NomadAI** is not just a bot—it's your witty, multilingual, AI-powered best friend in Delhi! Experience the city like a true local, with real-time recommendations, secret tips, and voice-driven conversations in your language.
 
 ---
@@ -11,9 +9,9 @@
 - **🎤 Voice-First Experience:** Send voice messages in any language—get instant, friendly voice replies.
 - **🌏 Multilingual & Persona-Driven:** Adapts its personality and language (Hinglish, French, Spanish, English) to match yours.
 - **📍 Real-Time Data:** Integrates Google Maps Places API for up-to-date recommendations.
-- **🤫 Insider Secrets:** Shares curated, hyperlocal tips you won't find on Google.
-- **🧠 Advanced AI:** Combines LLMs (Groq, Whisper) for language detection, synthesis, and creative responses.
-- **⚡ Hackathon-Ready:** FastAPI backend, Telegram integration, and modular design for rapid deployment.
+- **🤫 Insider Secrets:** Shares curated, hyperlocal tips from `delhi_secrets.json` you won't find on Google.
+- **🧠 AI Pipeline:** Whisper (local `base` model) for speech-to-text, Groq Llama 3 (8B for language & vibe detection, 70B for responses), and gTTS for voice replies.
+- **⚡ Deploy Anywhere:** FastAPI backend, Telegram integration, and a Dockerfile ready for Cloud Run or any container host.
 
 ---
 
@@ -44,17 +42,22 @@ graph TD;
 
 ## 🛠️ Quickstart
 
+### 0. **Prerequisites**
+- Python 3.10+ (the Docker image uses 3.12)
+- **ffmpeg** — required by Whisper for audio decoding (`sudo apt install ffmpeg` or `brew install ffmpeg`)
+- A Telegram bot token ([@BotFather](https://t.me/BotFather)), a [Groq API key](https://console.groq.com), and a [Google Maps API key](https://console.cloud.google.com) with Places API enabled
+
 ### 1. **Clone the Repo**
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/bharat3645/NomadAI.git
 cd NomadAI
 ```
 
 ### 2. **Install Dependencies**
-If you see permission errors, use `--user`:
 ```bash
-pip install --user -r requirements.txt
+pip install -r requirements.txt
 ```
+If you see permission errors, use `pip install --user -r requirements.txt`.
 
 ### 3. **Configure Environment**
 Create a `.env` file in the root:
@@ -62,28 +65,45 @@ Create a `.env` file in the root:
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token
 GROQ_API_KEY=your_groq_api_key
 GOOGLE_MAPS_API_KEY=your_google_maps_api_key
+
+# Optional but recommended:
+WEBHOOK_URL=https://your-public-url        # if set, the webhook is registered automatically on startup
+WEBHOOK_SECRET_TOKEN=any_random_string     # auto-generated on each start if not set
 ```
+The first three keys are required — the app refuses to start without them.
 
 ### 4. **Run the Server**
 ```bash
 uvicorn main:app --reload
 ```
 
-### 5. **Set Telegram Webhook**
-Point your bot's webhook to your FastAPI server's public URL.
+### 5. **Telegram Webhook**
+If `WEBHOOK_URL` is set, the bot registers its webhook (with the secret token) automatically on startup — nothing to do.
+If not, set it manually via the Bot API. Note that incoming updates are verified against the `X-Telegram-Bot-Api-Secret-Token` header, so a manually set webhook must use the same secret token the server was started with.
+
+### 🐳 **Or Run with Docker**
+The image installs ffmpeg and all dependencies for you:
+```bash
+docker build -t nomadai .
+docker run --env-file .env -p 8080:8080 nomadai
+```
+The container listens on `$PORT` (default `8080`), which makes it Cloud Run–compatible out of the box.
 
 ---
 
 ## 🤖 How It Works
 
 1. **User sends a voice message** to the Telegram bot.
-2. **Whisper** transcribes the audio to text.
-3. **Groq LLM** detects the language and crafts a persona-driven prompt.
-4. **Google Maps API** fetches live recommendations for Delhi.
-5. **Insider tips** are pulled from `delhi_secrets.json`.
-6. **Groq LLM** synthesizes a friendly, context-aware response.
+2. **Whisper** (local `base` model) transcribes the audio to text.
+3. **Groq Llama 3 8B** detects the language *and* the user's vibe (adventurous, hungry, relaxed, ...) in a single JSON call.
+4. **Google Maps Places API** fetches the top live recommendations for the query in Delhi.
+5. **Insider tips** are matched from `delhi_secrets.json` when a known landmark appears in the query.
+6. **Groq Llama 3 70B** synthesizes a persona-driven response, aware of the current Delhi time, the user's vibe, and the last two exchanges of conversation history.
 7. **gTTS** converts the reply to speech.
-8. **Bot sends a voice reply** (and text) back to the user.
+8. **The bot sends a voice reply** back to the user.
+
+**Bot commands:** `/start` (welcome + resets conversation history) · `/feedback <text>` (logs your feedback)
+**Endpoints:** `POST /` (Telegram webhook, secret-token protected) · `GET /health` (health check)
 
 ---
 
@@ -108,23 +128,26 @@ Point your bot's webhook to your FastAPI server's public URL.
 - **Persona Chameleon:** Adapts tone, slang, and warmth to your language and vibe.
 - **Voice-to-Voice Magic:** Full duplex—speak and get spoken to, no typing needed.
 - **Local Wisdom:** Goes beyond Google with real, lived-in tips.
-- **Plug-and-Play:** Ready for hackathons, demos, or real-world deployment.
+- **Context-Aware:** Knows the current time in Delhi and remembers the last couple of exchanges, so follow-ups like "how do I get there?" just work.
 - **Extensible:** Add more cities, languages, or data sources with ease.
 
 ---
 
 ## 🧩 Extending NomadAI
 - Add more landmarks and tips in `delhi_secrets.json`.
-- Expand persona logic for new languages or cities.
+- Expand the persona map in `main.py` for new languages or cities.
 - Integrate more APIs (weather, events, etc.).
-- Deploy on cloud (Render, Heroku, etc.) for global access.
+- Deploy the container to Cloud Run, Render, or any Docker host.
 
 ---
 
 ## 📝 File Structure
-- `main.py` — Core logic (Telegram, FastAPI, AI, APIs)
+- `main.py` — Core logic (FastAPI webhook, Telegram handlers, AI pipeline, APIs)
 - `delhi_secrets.json` — Local tips database
 - `requirements.txt` — Python dependencies
+- `Dockerfile` — Container image (installs ffmpeg + deps)
+- `entrypoint.sh` — Container entrypoint; serves on `$PORT` (default 8080)
+- `LICENSE` — MIT license
 - `README.md` — This file
 
 ---
@@ -136,7 +159,7 @@ This project is licensed under the MIT License — see [LICENSE](./LICENSE) for 
 
 ## 💡 Inspiration & Credits
 - Built for hackathons, travel lovers, and Delhi explorers.
-- Powered by OpenAI Whisper, Groq LLM, Google Maps, and the amazing Python community.
+- Powered by OpenAI Whisper, Groq (Llama 3), Google Maps, gTTS, and the amazing Python community.
 
 ---
 
